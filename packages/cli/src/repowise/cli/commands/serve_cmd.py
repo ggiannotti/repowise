@@ -443,6 +443,39 @@ def _local_build_is_stale(web_dir: Path) -> bool:
     return False
 
 
+def _safe_extract_tar(archive: Path, dest: Path) -> None:
+    """Extract a .tar.gz into ``dest``, refusing any member that would land outside it."""
+    root = dest.resolve()
+
+    def _inside(target: Path) -> bool:
+        return target == root or target.is_relative_to(root)
+
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        for m in members:
+            name = m.name.replace("\\", "/")
+            if name.startswith("/") or Path(name).is_absolute():
+                raise ValueError(f"archive member has an absolute path: {m.name}")
+            target = (root / name).resolve()
+            if not _inside(target):
+                raise ValueError(f"archive member escapes the destination: {m.name}")
+            if m.issym() or m.islnk():
+                link = m.linkname.replace("\\", "/")
+                if link.startswith("/") or Path(link).is_absolute():
+                    raise ValueError(f"archive link has an absolute target: {m.name}")
+                # Symlinks resolve from the member's directory, hardlinks from the root.
+                base = target.parent if m.issym() else root
+                if not _inside((base / link).resolve()):
+                    raise ValueError(f"archive link escapes the destination: {m.name}")
+            elif not (m.isfile() or m.isdir()):
+                raise ValueError(f"archive member is not a file or directory: {m.name}")
+        # The stdlib data filter (3.11.4+) re-checks the same rules at write time.
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(root, members=members, filter="data")
+        else:
+            tar.extractall(root, members=members)
+
+
 def _download_web(version: str) -> bool:
     """Download pre-built web frontend from GitHub releases."""
     import httpx
@@ -474,8 +507,7 @@ def _download_web(version: str) -> bool:
             else:
                 item.unlink()
 
-        with tarfile.open(tmp_path, "r:gz") as tar:
-            tar.extractall(_WEB_CACHE_DIR)
+        _safe_extract_tar(Path(tmp_path), _WEB_CACHE_DIR)
 
         _MARKER_FILE.write_text(version)
         console.print("[green]Web UI downloaded and cached.[/green]")
