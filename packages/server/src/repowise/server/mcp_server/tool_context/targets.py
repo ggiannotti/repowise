@@ -22,7 +22,7 @@ from repowise.core.analysis.communities import has_community
 from repowise.core.analysis.decisions.lifecycle import is_governing
 from repowise.core.analysis.decisions.scope import binds_to_paths
 from repowise.core.attribution import attribution_enabled, file_share
-from repowise.core.generation.page_selection import STALE_STATUSES
+from repowise.core.generation.page_selection import is_stale_status
 from repowise.core.ingestion.models import (
     NON_DEPENDENCY_EDGE_TYPES,
     SYMBOL_USE_EDGE_TYPES,
@@ -51,6 +51,7 @@ from repowise.server.mcp_server._edit_sites import reference_edit_set
 from repowise.server.mcp_server._helpers import (
     LIKE_ESCAPE,
     _decision_body,
+    clean_signature,
     escape_like,
     filter_dicts_by_key,
     filter_path_list,
@@ -160,7 +161,7 @@ async def _compact_symbol_rows(
         row: dict[str, Any] = {
             "name": s.name,
             "kind": s.kind,
-            "signature": _clean_signature(s.signature),
+            "signature": clean_signature(s.signature),
             "line": s.start_line,
         }
         sid = symbol_identity(s.symbol_id)
@@ -360,16 +361,6 @@ def _file_preview(repo_root: Any, file_path: str) -> dict[str, Any] | None:
         "No indexed symbols; counts and a short excerpt only. Read the file for its content."
     )
     return preview
-
-
-def _clean_signature(signature: str | None) -> str:
-    """Collapse a stored signature onto one line.
-
-    Signatures indexed from CRLF files carry literal ``\\r\\n`` plus the
-    original indentation — pure token waste in a triage card. Whitespace
-    runs collapse to single spaces; the text is unchanged otherwise.
-    """
-    return " ".join((signature or "").split())
 
 
 def _size_exclusion_note(repo_root: Any, target: str) -> str | None:
@@ -844,7 +835,7 @@ async def _resolve_one_target(
                     {
                         "name": s.name,
                         "kind": s.kind,
-                        "signature": _clean_signature(s.signature),
+                        "signature": clean_signature(s.signature),
                         "start_line": s.start_line,
                         "end_line": s.end_line,
                         "symbol_id": symbol_identity(s.symbol_id),
@@ -981,7 +972,7 @@ async def _resolve_one_target(
             ):
                 value = getattr(sym, attr, None)
                 if value:
-                    docs[key] = _clean_signature(value) if attr == "signature" else value
+                    docs[key] = clean_signature(value) if attr == "signature" else value
             # File page summary (full content gated behind include=["full_doc"])
             sym_page_id = f"file_page:{sym.file_path}"
             sym_page = await session.get(Page, sym_page_id)
@@ -1321,27 +1312,23 @@ async def _resolve_one_target(
             )
 
     # --- Freshness ---
-    # ``is_stale`` uses ``STALE_STATUSES``, the set ``repowise generate --stale``
+    # ``is_stale`` uses ``is_stale_status``, the rule ``repowise generate --stale``
     # uses, so "stale" means one thing. Not ``confidence``: that rates how far a
     # page can be trusted, not whether it has fallen behind the code.
     if include is None or "freshness" in include:
         freshness: dict[str, Any] = {}
 
-        def _is_stale(row: Page) -> bool:
-            # The column is NOT NULL, but a hand-written None reads as fresh.
-            return (row.freshness_status or "fresh") in STALE_STATUSES
-
         if page:
             freshness["confidence_score"] = page.confidence
             freshness["freshness_status"] = page.freshness_status
-            freshness["is_stale"] = _is_stale(page)
+            freshness["is_stale"] = is_stale_status(page.freshness_status)
         elif target_type == "symbol" and file_path_for_git:
             sym_page_id = f"file_page:{file_path_for_git}"
             sym_page = await session.get(Page, sym_page_id)
             if sym_page:
                 freshness["confidence_score"] = sym_page.confidence
                 freshness["freshness_status"] = sym_page.freshness_status
-                freshness["is_stale"] = _is_stale(sym_page)
+                freshness["is_stale"] = is_stale_status(sym_page.freshness_status)
             else:
                 freshness["confidence_score"] = None
                 freshness["freshness_status"] = None
