@@ -17,8 +17,11 @@ def _make_tar(path: Path, members: list[tuple[str, str | None, bytes]]) -> Path:
         for name, link, data in members:
             info = tarfile.TarInfo(name)
             if link is not None:
-                info.type = tarfile.SYMTYPE
-                info.linkname = link
+                # "hard:" prefix marks a hardlink; otherwise a symlink.
+                if link.startswith("hard:"):
+                    info.type, info.linkname = tarfile.LNKTYPE, link[5:]
+                else:
+                    info.type, info.linkname = tarfile.SYMTYPE, link
                 tar.addfile(info)
             else:
                 info.size = len(data)
@@ -54,9 +57,14 @@ def test_legit_archive_extracts_as_before(tmp_path: Path) -> None:
     [
         ("../evil.txt", None, "escapes the destination"),
         ("sub/../../evil.txt", None, "escapes the destination"),
-        ("/evil.txt", None, "absolute path"),
+        ("/evil.txt", None, "absolute or drive-qualified"),
         ("link", "../../evil_dir", "link escapes"),
-        ("link", "/etc", "absolute target"),
+        ("link", "/etc", "absolute or drive-qualified"),
+        ("C:evil.txt", None, "drive-qualified"),
+        ("a:stream", None, "drive-qualified"),
+        ("//server/share/evil.txt", None, "drive-qualified"),
+        ("link", "C:evil", "drive-qualified"),
+        ("hl", "hard:../evil.txt", "link escapes"),
     ],
 )
 def test_escaping_member_is_rejected(
@@ -104,3 +112,71 @@ def test_download_web_reports_failure_on_tampered_archive(
     assert serve_cmd._download_web("0.0.0") is False
     assert not (dest / ".version").exists()
     assert not (tmp_path / "cache" / "evil.txt").exists()
+
+
+def _assert_nothing_written(tmp_path: Path, dest: Path) -> None:
+    assert list(dest.iterdir()) == []
+    assert not (tmp_path / "cache" / "b").exists()
+    assert not (tmp_path / "cache" / "evil").exists()
+
+
+def test_symlink_chain_is_rejected(tmp_path: Path) -> None:
+    archive = _make_tar(tmp_path / "web.tar.gz", [("a", ".", b""), ("a/b", "..", b"")])
+    dest = _dest(tmp_path)
+    with pytest.raises(ValueError, match="passes through a link"):
+        serve_cmd._safe_extract_tar(archive, dest)
+    _assert_nothing_written(tmp_path, dest)
+
+
+def test_hardlink_through_symlink_is_rejected(tmp_path: Path) -> None:
+    archive = _make_tar(tmp_path / "web.tar.gz", [("a", ".", b""), ("h", "hard:a", b"")])
+    dest = _dest(tmp_path)
+    with pytest.raises(ValueError, match="passes through a link"):
+        serve_cmd._safe_extract_tar(archive, dest)
+    _assert_nothing_written(tmp_path, dest)
+
+
+@pytest.mark.parametrize("kind", [tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE])
+def test_special_file_member_is_rejected(tmp_path: Path, kind: bytes) -> None:
+    archive = tmp_path / "web.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        info = tarfile.TarInfo("dev")
+        info.type = kind
+        tar.addfile(info)
+    dest = _dest(tmp_path)
+    with pytest.raises(ValueError, match="not a file or directory"):
+        serve_cmd._safe_extract_tar(archive, dest)
+    _assert_nothing_written(tmp_path, dest)
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        [("a", "..", b""), ("a/evil", None, b"pwned")],
+        [("../evil", None, b"pwned")],
+        [("a", ".", b""), ("a/b", "..", b"")],
+    ],
+)
+def test_fallback_without_data_filter_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: list[tuple[str, str | None, bytes]]
+) -> None:
+    monkeypatch.delattr(tarfile, "data_filter", raising=False)
+    archive = _make_tar(tmp_path / "web.tar.gz", members)
+    dest = _dest(tmp_path)
+    with pytest.raises(ValueError):
+        serve_cmd._safe_extract_tar(archive, dest)
+    _assert_nothing_written(tmp_path, dest)
+
+
+def test_fallback_without_data_filter_extracts_legit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delattr(tarfile, "data_filter", raising=False)
+    archive = _make_tar(
+        tmp_path / "web.tar.gz",
+        [("server.js", None, b"ok"), (".next/static/app.js", None, b"x")],
+    )
+    dest = _dest(tmp_path)
+    serve_cmd._safe_extract_tar(archive, dest)
+    assert (dest / "server.js").read_bytes() == b"ok"
+    assert (dest / ".next" / "static" / "app.js").read_bytes() == b"x"

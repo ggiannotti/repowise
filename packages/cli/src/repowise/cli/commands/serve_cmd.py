@@ -5,13 +5,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import posixpath
 import shutil
 import socket
 import subprocess
 import tarfile
 import tempfile
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import click
 
@@ -450,23 +451,41 @@ def _safe_extract_tar(archive: Path, dest: Path) -> None:
     def _inside(target: Path) -> bool:
         return target == root or target.is_relative_to(root)
 
+    def _check_name(raw: str, member: str, what: str) -> str:
+        name = raw.replace("\\", "/")
+        # A colon covers drive-relative names (C:x) and NTFS alternate data streams.
+        if (
+            name.startswith("/")
+            or Path(name).is_absolute()
+            or PureWindowsPath(name).drive
+            or ":" in name
+        ):
+            raise ValueError(f"archive {what} is absolute or drive-qualified: {member}")
+        return name
+
     with tarfile.open(archive, "r:gz") as tar:
         members = tar.getmembers()
+        symlinks = {posixpath.normpath(m.name.replace("\\", "/")) for m in members if m.issym()}
         for m in members:
-            name = m.name.replace("\\", "/")
-            if name.startswith("/") or Path(name).is_absolute():
-                raise ValueError(f"archive member has an absolute path: {m.name}")
+            name = _check_name(m.name, m.name, "member path")
             target = (root / name).resolve()
             if not _inside(target):
                 raise ValueError(f"archive member escapes the destination: {m.name}")
+            # Static resolution cannot follow links the archive itself creates, so no
+            # path may pass through one (blocks chains like a -> . then a/b -> ..).
+            parts = PurePosixPath(posixpath.normpath(name)).parts
+            if any("/".join(parts[:i]) in symlinks for i in range(1, len(parts))):
+                raise ValueError(f"archive member passes through a link: {m.name}")
             if m.issym() or m.islnk():
-                link = m.linkname.replace("\\", "/")
-                if link.startswith("/") or Path(link).is_absolute():
-                    raise ValueError(f"archive link has an absolute target: {m.name}")
+                link = _check_name(m.linkname, m.name, "link target")
                 # Symlinks resolve from the member's directory, hardlinks from the root.
                 base = target.parent if m.issym() else root
                 if not _inside((base / link).resolve()):
                     raise ValueError(f"archive link escapes the destination: {m.name}")
+                if m.islnk():
+                    lparts = PurePosixPath(posixpath.normpath(link)).parts
+                    if any("/".join(lparts[:i]) in symlinks for i in range(1, len(lparts) + 1)):
+                        raise ValueError(f"archive link passes through a link: {m.name}")
             elif not (m.isfile() or m.isdir()):
                 raise ValueError(f"archive member is not a file or directory: {m.name}")
         # The stdlib data filter (3.11.4+) re-checks the same rules at write time.
